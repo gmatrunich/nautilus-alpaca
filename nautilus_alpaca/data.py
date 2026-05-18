@@ -503,6 +503,7 @@ class AlpacaDataClient(LiveMarketDataClient):
         data = getattr(response, "data", response)
         if not isinstance(data, dict):
             return
+        now_ns = self._clock.timestamp_ns()
         for bar_type in bar_types:
             sym = bar_type.instrument_id.symbol.value
             raw_list = data.get(sym, []) or []
@@ -511,12 +512,22 @@ class AlpacaDataClient(LiveMarketDataClient):
             instrument = self._polled_bar_subs.get(bar_type)
             if instrument is None:
                 continue
+            threshold_ns = _bar_completion_ns(bar_type)
 
             parsed = [parse_bar(raw, bar_type, instrument) for raw in raw_list]
+            # Only treat a bar as final after enough time has elapsed since
+            # ts_event for Alpaca to have closed it. Without this gate,
+            # today's in-progress bar appears with the same ts_event as
+            # today's final bar — and the de-dup-on-ts logic would then
+            # filter the final bar out as a "duplicate" of itself.
+            complete = [b for b in parsed if now_ns - b.ts_event >= threshold_ns]
+
             if bar_type not in self._polled_bar_seeded:
-                # Seed-only pass: record the latest ts so the next poll
-                # pushes strictly-newer bars; do not dispatch anything.
-                self._polled_bar_last_ts[bar_type] = max(b.ts_event for b in parsed)
+                if not complete:
+                    # Nothing final yet (fresh registration on a weekend
+                    # / pre-market). Retry on the next poll cycle.
+                    continue
+                self._polled_bar_last_ts[bar_type] = max(b.ts_event for b in complete)
                 self._polled_bar_seeded.add(bar_type)
                 self._log.debug(
                     f"seeded {bar_type}: last_ts={self._polled_bar_last_ts[bar_type]}",
@@ -525,7 +536,7 @@ class AlpacaDataClient(LiveMarketDataClient):
 
             last_ts = self._polled_bar_last_ts.get(bar_type, 0)
             new_pushed = 0
-            for bar in parsed:
+            for bar in complete:
                 if bar.ts_event <= last_ts:
                     continue
                 self._handle_data(bar)
@@ -572,3 +583,28 @@ class AlpacaDataClient(LiveMarketDataClient):
         if isinstance(data, dict):
             return list(data.get(symbol, []))
         return list(data)
+
+
+_HOUR_NS = 3_600_000_000_000
+_DAY_NS = 86_400_000_000_000
+
+
+def _bar_completion_ns(bar_type: BarType) -> int:
+    """Time after ``ts_event`` by which a polled bar can be treated as final.
+
+    Alpaca daily bars use ``ts_event`` = bar's *start* (e.g. 04:00 UTC
+    for US equities) but the bar isn't finalized until after market close
+    (~20:00 UTC under DST, ~21:00 EST). 16h covers both regimes with a
+    margin. Weekly/monthly thresholds are conservative — push happens at
+    most one full bar-duration late, which is acceptable for those
+    aggregations.
+    """
+    from nautilus_trader.model.enums import BarAggregation
+    spec = bar_type.spec
+    if spec.aggregation == BarAggregation.DAY:
+        return 16 * _HOUR_NS
+    if spec.aggregation == BarAggregation.WEEK:
+        return 7 * _DAY_NS
+    if spec.aggregation == BarAggregation.MONTH:
+        return 31 * _DAY_NS
+    return _DAY_NS
