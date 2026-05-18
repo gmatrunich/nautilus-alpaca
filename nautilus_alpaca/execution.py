@@ -14,10 +14,15 @@ from typing import Any
 
 from alpaca.common.exceptions import APIError
 from alpaca.trading.enums import OrderClass as AlpacaOrderClass
+from alpaca.trading.enums import OrderType as AlpacaOrderType
+from alpaca.trading.enums import QueryOrderStatus
+from alpaca.trading.enums import TimeInForce as AlpacaTimeInForce
 from alpaca.trading.enums import TradeEvent
 from alpaca.trading.models import Order as AlpacaOrder
+from alpaca.trading.models import Position as AlpacaPosition
 from alpaca.trading.models import TradeAccount
 from alpaca.trading.models import TradeUpdate
+from alpaca.trading.requests import GetOrdersRequest
 from alpaca.trading.requests import LimitOrderRequest
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.requests import ReplaceOrderRequest
@@ -29,20 +34,32 @@ from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock
 from nautilus_trader.common.component import MessageBus
 from nautilus_trader.core.datetime import dt_to_unix_nanos
+from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.messages import BatchCancelOrders
 from nautilus_trader.execution.messages import CancelAllOrders
 from nautilus_trader.execution.messages import CancelOrder
+from nautilus_trader.execution.messages import GenerateFillReports
+from nautilus_trader.execution.messages import GenerateOrderStatusReport
+from nautilus_trader.execution.messages import GenerateOrderStatusReports
+from nautilus_trader.execution.messages import GeneratePositionStatusReports
 from nautilus_trader.execution.messages import ModifyOrder
 from nautilus_trader.execution.messages import QueryOrder
 from nautilus_trader.execution.messages import SubmitOrder
+from nautilus_trader.execution.reports import FillReport
+from nautilus_trader.execution.reports import OrderStatusReport
+from nautilus_trader.execution.reports import PositionStatusReport
 from nautilus_trader.live.execution_client import LiveExecutionClient
 from nautilus_trader.model.enums import AccountType
 from nautilus_trader.model.enums import LiquiditySide
 from nautilus_trader.model.enums import OmsType
 from nautilus_trader.model.enums import OrderSide as NautilusOrderSide
+from nautilus_trader.model.enums import OrderStatus
 from nautilus_trader.model.enums import OrderType as NautilusOrderType
+from nautilus_trader.model.enums import PositionSide
+from nautilus_trader.model.enums import TimeInForce as NautilusTimeInForce
 from nautilus_trader.model.identifiers import AccountId
 from nautilus_trader.model.identifiers import ClientOrderId
+from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import TradeId
 from nautilus_trader.model.identifiers import VenueOrderId
 from nautilus_trader.model.objects import AccountBalance
@@ -56,8 +73,10 @@ from nautilus_alpaca.common.constants import ALPACA
 from nautilus_alpaca.common.constants import ALPACA_CLIENT_ID
 from nautilus_alpaca.common.constants import ALPACA_VENUE
 from nautilus_alpaca.common.enums import ALPACA_TO_NAUTILUS_ORDER_SIDE
+from nautilus_alpaca.common.enums import ALPACA_TO_NAUTILUS_ORDER_STATUS
 from nautilus_alpaca.common.enums import NAUTILUS_TO_ALPACA_ORDER_SIDE
 from nautilus_alpaca.common.enums import NAUTILUS_TO_ALPACA_TIF
+from nautilus_alpaca.common.symbols import instrument_id_from_alpaca_symbol
 from nautilus_alpaca.config import AlpacaExecClientConfig
 from nautilus_alpaca.http.client import AlpacaHttpClient
 from nautilus_alpaca.providers import AlpacaInstrumentProvider
@@ -221,6 +240,113 @@ class AlpacaExecutionClient(LiveExecutionClient):
             await self._http.get_order_by_id(str(command.venue_order_id))
         except APIError as exc:  # noqa: BLE001
             self._log.warning(f"query_order failed: {exc}")
+
+    # ─── Reconciliation reports ────────────────────────────────────────────
+
+    async def generate_order_status_report(
+        self,
+        command: GenerateOrderStatusReport,
+    ) -> OrderStatusReport | None:
+        try:
+            if command.venue_order_id is not None:
+                alpaca_order = await self._http.get_order_by_id(str(command.venue_order_id))
+            elif command.client_order_id is not None:
+                alpaca_order = await self._http.get_order_by_client_id(
+                    command.client_order_id.value,
+                )
+            else:
+                self._log.warning("generate_order_status_report: no order id provided")
+                return None
+        except APIError as exc:  # noqa: BLE001
+            self._log.warning(f"generate_order_status_report failed: {exc}")
+            return None
+        return self._build_order_status_report(alpaca_order)
+
+    async def generate_order_status_reports(
+        self,
+        command: GenerateOrderStatusReports,
+    ) -> list[OrderStatusReport]:
+        status = QueryOrderStatus.OPEN if command.open_only else QueryOrderStatus.ALL
+        symbols = None
+        if command.instrument_id is not None:
+            symbols = [command.instrument_id.symbol.value]
+        request = GetOrdersRequest(
+            status=status,
+            after=command.start,
+            until=command.end,
+            symbols=symbols,
+            direction="desc",
+            limit=500,
+            nested=False,
+        )
+        try:
+            alpaca_orders = await self._http.get_orders(request)
+        except APIError as exc:  # noqa: BLE001
+            self._log.error(f"generate_order_status_reports failed: {exc}")
+            return []
+        reports: list[OrderStatusReport] = []
+        for alpaca_order in alpaca_orders:
+            report = self._build_order_status_report(alpaca_order)
+            if report is not None:
+                reports.append(report)
+        return reports
+
+    async def generate_fill_reports(
+        self,
+        command: GenerateFillReports,
+    ) -> list[FillReport]:
+        try:
+            activities = await self._http.get_activities(
+                "FILL",
+                after=command.start,
+                until=command.end,
+                direction="desc",
+                page_size=500,
+            )
+        except APIError as exc:  # noqa: BLE001
+            self._log.warning(f"generate_fill_reports failed: {exc}")
+            return []
+
+        instrument_filter: str | None = (
+            command.instrument_id.symbol.value if command.instrument_id is not None else None
+        )
+        venue_order_filter: str | None = (
+            str(command.venue_order_id) if command.venue_order_id is not None else None
+        )
+
+        reports: list[FillReport] = []
+        for raw in activities:
+            symbol = raw.get("symbol")
+            if symbol is None:
+                continue
+            if instrument_filter is not None and symbol != instrument_filter:
+                continue
+            order_id = raw.get("order_id")
+            if venue_order_filter is not None and order_id != venue_order_filter:
+                continue
+            report = self._build_fill_report(raw)
+            if report is not None:
+                reports.append(report)
+        return reports
+
+    async def generate_position_status_reports(
+        self,
+        command: GeneratePositionStatusReports,
+    ) -> list[PositionStatusReport]:
+        try:
+            positions = await self._http.get_all_positions()
+        except APIError as exc:  # noqa: BLE001
+            self._log.error(f"generate_position_status_reports failed: {exc}")
+            return []
+        reports: list[PositionStatusReport] = []
+        for pos in positions:
+            if command.instrument_id is not None:
+                if pos.symbol != command.instrument_id.symbol.value:
+                    continue
+            report = self._build_position_status_report(pos)
+            if report is not None:
+                reports.append(report)
+        return reports
 
     # ─── Trade stream handler ──────────────────────────────────────────────
 
@@ -406,16 +532,192 @@ class AlpacaExecutionClient(LiveExecutionClient):
 
     # ─── Helpers ───────────────────────────────────────────────────────────
 
-    def _instrument_id_for(self, symbol: str):
-        from nautilus_alpaca.common.symbols import instrument_id_from_alpaca_symbol
+    def _instrument_id_for(self, symbol: str) -> InstrumentId:
         return instrument_id_from_alpaca_symbol(symbol)
+
+    def _build_order_status_report(
+        self,
+        alpaca_order: AlpacaOrder,
+    ) -> OrderStatusReport | None:
+        if alpaca_order.symbol is None:
+            return None
+        instrument_id = self._instrument_id_for(alpaca_order.symbol)
+        instrument = self._instrument_provider.find(instrument_id)
+        price_precision = instrument.price_precision if instrument is not None else 2
+        size_precision = instrument.size_precision if instrument is not None else 0
+
+        order_side = ALPACA_TO_NAUTILUS_ORDER_SIDE.get(
+            alpaca_order.side,
+            NautilusOrderSide.NO_ORDER_SIDE,
+        )
+        order_type = _ALPACA_ORDER_TYPE_TO_NAUTILUS.get(
+            alpaca_order.type if alpaca_order.type is not None else AlpacaOrderType.MARKET,
+            NautilusOrderType.MARKET,
+        )
+        tif = _ALPACA_TIF_TO_NAUTILUS.get(
+            alpaca_order.time_in_force,
+            NautilusTimeInForce.DAY,
+        )
+        order_status = ALPACA_TO_NAUTILUS_ORDER_STATUS.get(
+            alpaca_order.status,
+            OrderStatus.ACCEPTED,
+        )
+        qty = Quantity(
+            Decimal(str(alpaca_order.qty)) if alpaca_order.qty else Decimal(0),
+            size_precision,
+        )
+        filled_qty = Quantity(
+            Decimal(str(alpaca_order.filled_qty)) if alpaca_order.filled_qty else Decimal(0),
+            size_precision,
+        )
+        ts_accepted = (
+            dt_to_unix_nanos(alpaca_order.submitted_at)
+            if alpaca_order.submitted_at
+            else dt_to_unix_nanos(alpaca_order.created_at)
+        )
+        ts_last = dt_to_unix_nanos(alpaca_order.updated_at or alpaca_order.created_at)
+        ts_init = self._clock.timestamp_ns()
+        client_order_id = (
+            ClientOrderId(alpaca_order.client_order_id)
+            if alpaca_order.client_order_id
+            else None
+        )
+
+        kwargs: dict[str, Any] = {
+            "account_id": self.account_id or self._fallback_account_id(),
+            "instrument_id": instrument_id,
+            "venue_order_id": VenueOrderId(str(alpaca_order.id)),
+            "order_side": order_side,
+            "order_type": order_type,
+            "time_in_force": tif,
+            "order_status": order_status,
+            "quantity": qty,
+            "filled_qty": filled_qty,
+            "report_id": UUID4(),
+            "ts_accepted": ts_accepted,
+            "ts_last": ts_last,
+            "ts_init": ts_init,
+        }
+        if client_order_id is not None:
+            kwargs["client_order_id"] = client_order_id
+        if alpaca_order.limit_price is not None:
+            kwargs["price"] = Price(Decimal(str(alpaca_order.limit_price)), price_precision)
+        if alpaca_order.stop_price is not None:
+            kwargs["trigger_price"] = Price(
+                Decimal(str(alpaca_order.stop_price)),
+                price_precision,
+            )
+        if alpaca_order.filled_avg_price is not None:
+            kwargs["avg_px"] = Decimal(str(alpaca_order.filled_avg_price))
+        return OrderStatusReport(**kwargs)
+
+    def _build_fill_report(self, raw: dict[str, Any]) -> FillReport | None:
+        symbol = raw.get("symbol")
+        order_id = raw.get("order_id")
+        if symbol is None or order_id is None:
+            return None
+        try:
+            qty_raw = raw.get("qty")
+            px_raw = raw.get("price")
+            if qty_raw is None or px_raw is None:
+                return None
+            instrument_id = self._instrument_id_for(symbol)
+            instrument = self._instrument_provider.find(instrument_id)
+            size_precision = instrument.size_precision if instrument is not None else 0
+            price_precision = instrument.price_precision if instrument is not None else 2
+
+            side_raw = (raw.get("side") or "").lower()
+            order_side = (
+                NautilusOrderSide.BUY if side_raw == "buy"
+                else NautilusOrderSide.SELL if side_raw == "sell"
+                else NautilusOrderSide.NO_ORDER_SIDE
+            )
+            from datetime import datetime as _dt
+            transaction_time = raw.get("transaction_time")
+            ts_event = (
+                dt_to_unix_nanos(_dt.fromisoformat(transaction_time.replace("Z", "+00:00")))
+                if isinstance(transaction_time, str)
+                else self._clock.timestamp_ns()
+            )
+            return FillReport(
+                account_id=self.account_id or self._fallback_account_id(),
+                instrument_id=instrument_id,
+                venue_order_id=VenueOrderId(str(order_id)),
+                trade_id=TradeId(str(raw.get("id", f"alpaca-fill-{ts_event}"))),
+                order_side=order_side,
+                last_qty=Quantity(Decimal(str(qty_raw)), size_precision),
+                last_px=Price(Decimal(str(px_raw)), price_precision),
+                commission=Money(Decimal(0), Currency.from_str("USD")),
+                liquidity_side=LiquiditySide.NO_LIQUIDITY_SIDE,
+                report_id=UUID4(),
+                ts_event=ts_event,
+                ts_init=self._clock.timestamp_ns(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._log.warning(f"failed to build FillReport from {raw}: {exc}")
+            return None
+
+    def _build_position_status_report(
+        self,
+        pos: AlpacaPosition,
+    ) -> PositionStatusReport | None:
+        if pos.symbol is None:
+            return None
+        instrument_id = self._instrument_id_for(pos.symbol)
+        instrument = self._instrument_provider.find(instrument_id)
+        size_precision = instrument.size_precision if instrument is not None else 0
+        try:
+            qty_decimal = Decimal(str(pos.qty)) if pos.qty is not None else Decimal(0)
+        except Exception:  # noqa: BLE001
+            qty_decimal = Decimal(0)
+        position_side = (
+            PositionSide.LONG if qty_decimal > 0
+            else PositionSide.SHORT if qty_decimal < 0
+            else PositionSide.FLAT
+        )
+        avg_px = (
+            Decimal(str(pos.avg_entry_price))
+            if pos.avg_entry_price is not None
+            else None
+        )
+        ts = self._clock.timestamp_ns()
+        kwargs: dict[str, Any] = {
+            "account_id": self.account_id or self._fallback_account_id(),
+            "instrument_id": instrument_id,
+            "position_side": position_side,
+            "quantity": Quantity(abs(qty_decimal), size_precision),
+            "report_id": UUID4(),
+            "ts_last": ts,
+            "ts_init": ts,
+        }
+        if avg_px is not None:
+            kwargs["avg_px_open"] = avg_px
+        return PositionStatusReport(**kwargs)
+
+    def _fallback_account_id(self) -> AccountId:
+        return AccountId(f"{ALPACA}-PENDING")
 
 
 # ─── Order request builder ────────────────────────────────────────────────
 
 
-_ORDER_TYPE_MAP = {
-    # Alpaca → Nautilus reverse map (kept here to avoid circular import in enums)
+_ORDER_TYPE_MAP: dict[AlpacaOrderType, NautilusOrderType] = {
+    AlpacaOrderType.MARKET: NautilusOrderType.MARKET,
+    AlpacaOrderType.LIMIT: NautilusOrderType.LIMIT,
+    AlpacaOrderType.STOP: NautilusOrderType.STOP_MARKET,
+    AlpacaOrderType.STOP_LIMIT: NautilusOrderType.STOP_LIMIT,
+    AlpacaOrderType.TRAILING_STOP: NautilusOrderType.TRAILING_STOP_MARKET,
+}
+
+_ALPACA_ORDER_TYPE_TO_NAUTILUS = _ORDER_TYPE_MAP
+
+_ALPACA_TIF_TO_NAUTILUS: dict[AlpacaTimeInForce, NautilusTimeInForce] = {
+    AlpacaTimeInForce.DAY: NautilusTimeInForce.DAY,
+    AlpacaTimeInForce.GTC: NautilusTimeInForce.GTC,
+    AlpacaTimeInForce.IOC: NautilusTimeInForce.IOC,
+    AlpacaTimeInForce.FOK: NautilusTimeInForce.FOK,
+    AlpacaTimeInForce.OPG: NautilusTimeInForce.AT_THE_OPEN,
+    AlpacaTimeInForce.CLS: NautilusTimeInForce.AT_THE_CLOSE,
 }
 
 
@@ -467,18 +769,3 @@ def _build_order_request(symbol: str, order: NautilusOrder):
     raise ValueError(f"Unsupported order type: {order.order_type}")
 
 
-# Populate _ORDER_TYPE_MAP at import time (avoids circular module init)
-def _init_order_type_map() -> None:
-    from alpaca.trading.enums import OrderType as _AlpacaOT
-    _ORDER_TYPE_MAP.update(
-        {
-            _AlpacaOT.MARKET: NautilusOrderType.MARKET,
-            _AlpacaOT.LIMIT: NautilusOrderType.LIMIT,
-            _AlpacaOT.STOP: NautilusOrderType.STOP_MARKET,
-            _AlpacaOT.STOP_LIMIT: NautilusOrderType.STOP_LIMIT,
-            _AlpacaOT.TRAILING_STOP: NautilusOrderType.TRAILING_STOP_MARKET,
-        }
-    )
-
-
-_init_order_type_map()

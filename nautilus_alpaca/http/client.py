@@ -146,6 +146,32 @@ class AlpacaHttpClient:
             order_data,
         )
 
+    async def get_activities(
+        self,
+        activity_type: str = "FILL",
+        *,
+        after: datetime | None = None,
+        until: datetime | None = None,
+        direction: str = "desc",
+        page_size: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Fetch raw account-activity records (fills, dividends, etc.).
+
+        ``alpaca-py`` does not type these, so we hit the REST endpoint
+        directly. Returns the JSON list as-is. ``activity_type="FILL"``
+        is what reconciliation cares about.
+        """
+        params: dict[str, Any] = {
+            "direction": direction,
+            "page_size": page_size,
+        }
+        if after is not None:
+            params["after"] = after.isoformat()
+        if until is not None:
+            params["until"] = until.isoformat()
+        path = f"/account/activities/{activity_type}"
+        return await asyncio.to_thread(self._trading.get, path, params)
+
     # ── Positions ──────────────────────────────────────────────────────────
 
     async def get_all_positions(self) -> list[Position]:
