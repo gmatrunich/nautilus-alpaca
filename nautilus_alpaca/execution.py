@@ -639,11 +639,17 @@ class AlpacaExecutionClient(LiveExecutionClient):
                 if isinstance(transaction_time, str)
                 else self._clock.timestamp_ns()
             )
+            activity_id = str(raw.get("id") or f"alpaca-fill-{ts_event}")
+            # Alpaca activity ids have the form "<ts>::<uuid>"; the
+            # combined string is 55 chars whereas TradeId caps at 36, so
+            # take the uuid suffix when present.
+            if "::" in activity_id:
+                _, _, activity_id = activity_id.rpartition("::")
             return FillReport(
                 account_id=self.account_id or self._fallback_account_id(),
                 instrument_id=instrument_id,
                 venue_order_id=VenueOrderId(str(order_id)),
-                trade_id=TradeId(str(raw.get("id", f"alpaca-fill-{ts_event}"))),
+                trade_id=TradeId(activity_id[:36]),
                 order_side=order_side,
                 last_qty=Quantity(Decimal(str(qty_raw)), size_precision),
                 last_px=Price(Decimal(str(px_raw)), price_precision),
