@@ -446,6 +446,9 @@ class AlpacaDataClient(LiveMarketDataClient):
                 self._log.warning(f"daily bar poll iteration failed: {exc}")
 
     async def _poll_daily_bars_once(self) -> None:
+        seeded_before = len(self._polled_bar_seeded)
+        # Per-cycle counters so we can log a single observable summary line.
+        self._poll_cycle_pushed = 0
         # Group polled subscriptions by stream kind so we can batch.
         groups: dict[StreamKind, list[BarType]] = defaultdict(list)
         for bar_type in list(self._polled_bar_subs.keys()):
@@ -498,6 +501,13 @@ class AlpacaDataClient(LiveMarketDataClient):
                         self._log.warning(f"daily bar poll fetch failed: {exc}")
                         continue
                     self._dispatch_polled_bars(chunk_bts, response)
+        seeded_after = len(self._polled_bar_seeded)
+        newly_seeded = seeded_after - seeded_before
+        if newly_seeded or self._poll_cycle_pushed:
+            self._log.info(
+                f"daily bar poll: {len(self._polled_bar_subs)} subs, "
+                f"seeded={newly_seeded}, pushed={self._poll_cycle_pushed}",
+            )
 
     def _dispatch_polled_bars(self, bar_types: list[BarType], response: Any) -> None:
         data = getattr(response, "data", response)
@@ -544,6 +554,7 @@ class AlpacaDataClient(LiveMarketDataClient):
                 new_pushed += 1
             if new_pushed:
                 self._polled_bar_last_ts[bar_type] = last_ts
+                self._poll_cycle_pushed += new_pushed
                 self._log.info(f"polled {bar_type}: pushed {new_pushed} new bar(s)")
 
     # ─── Routing helpers ──────────────────────────────────────────────────
