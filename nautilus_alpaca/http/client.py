@@ -163,7 +163,8 @@ class AlpacaHttpClient:
         """
         params: dict[str, Any] = {
             "direction": direction,
-            "page_size": page_size,
+            # Alpaca caps page_size at 100 on /account/activities.
+            "page_size": min(page_size, 100),
         }
         if after is not None:
             params["after"] = after.isoformat()

@@ -32,6 +32,9 @@ from nautilus_trader.model.instruments import Instrument
 
 from nautilus_alpaca.common.credentials import load_credentials
 from nautilus_alpaca.common.symbols import is_crypto_symbol
+from alpaca.data.enums import CryptoFeed
+from alpaca.data.enums import DataFeed
+
 from nautilus_alpaca.common.symbols import is_option_symbol
 from nautilus_alpaca.http.client import AlpacaHttpClient
 from nautilus_alpaca.parsers import bar_spec_to_timeframe
@@ -52,12 +55,16 @@ class AlpacaHistoricalDataLoader:
         self,
         http_client: AlpacaHttpClient,
         instrument_provider: AlpacaInstrumentProvider | None = None,
+        stock_feed: DataFeed = DataFeed.IEX,
+        crypto_feed: CryptoFeed = CryptoFeed.US,
     ) -> None:
         self._http = http_client
         self._provider = instrument_provider or AlpacaInstrumentProvider(
             client=http_client,
             config=InstrumentProviderConfig(load_all=False),
         )
+        self._stock_feed = stock_feed
+        self._crypto_feed = crypto_feed
 
     # ─── Constructors ──────────────────────────────────────────────────────
 
@@ -104,7 +111,7 @@ class AlpacaHistoricalDataLoader:
         elif is_crypto_symbol(symbol):
             resp = await self._http.get_crypto_bars(symbol, timeframe, start, end, limit)
         else:
-            resp = await self._http.get_stock_bars(symbol, timeframe, start, end, limit)
+            resp = await self._http.get_stock_bars(symbol, timeframe, start, end, limit, feed=self._stock_feed)
         raw = _extract_symbol_series(resp, symbol)
         return [parse_bar(b, bar_type, instrument) for b in raw]
 
@@ -125,7 +132,7 @@ class AlpacaHistoricalDataLoader:
         if is_crypto_symbol(symbol):
             resp = await self._http.get_crypto_quotes(symbol, start, end, limit)
         else:
-            resp = await self._http.get_stock_quotes(symbol, start, end, limit)
+            resp = await self._http.get_stock_quotes(symbol, start, end, limit, feed=self._stock_feed)
         raw = _extract_symbol_series(resp, symbol)
         return [parse_quote(q, instrument) for q in raw]
 
@@ -144,7 +151,7 @@ class AlpacaHistoricalDataLoader:
         elif is_crypto_symbol(symbol):
             resp = await self._http.get_crypto_trades(symbol, start, end, limit)
         else:
-            resp = await self._http.get_stock_trades(symbol, start, end, limit)
+            resp = await self._http.get_stock_trades(symbol, start, end, limit, feed=self._stock_feed)
         raw = _extract_symbol_series(resp, symbol)
         return [parse_trade(t, instrument) for t in raw]
 

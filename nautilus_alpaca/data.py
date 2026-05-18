@@ -278,10 +278,12 @@ class AlpacaDataClient(LiveMarketDataClient):
         if is_crypto_symbol(symbol):
             response = await self._http.get_crypto_quotes(
                 symbol, request.start, request.end, request.limit,
+                feed=CryptoFeed(self._config.crypto_feed),
             )
         else:
             response = await self._http.get_stock_quotes(
                 symbol, request.start, request.end, request.limit,
+                feed=DataFeed(self._config.stock_feed),
             )
         raw_quotes = self._extract_symbol_series(response, symbol)
         ticks = [parse_quote(q, instrument) for q in raw_quotes]
@@ -310,10 +312,12 @@ class AlpacaDataClient(LiveMarketDataClient):
         elif is_crypto_symbol(symbol):
             response = await self._http.get_crypto_trades(
                 symbol, request.start, request.end, request.limit,
+                feed=CryptoFeed(self._config.crypto_feed),
             )
         else:
             response = await self._http.get_stock_trades(
                 symbol, request.start, request.end, request.limit,
+                feed=DataFeed(self._config.stock_feed),
             )
         raw_trades = self._extract_symbol_series(response, symbol)
         ticks = [parse_trade(t, instrument) for t in raw_trades]
@@ -345,10 +349,12 @@ class AlpacaDataClient(LiveMarketDataClient):
         elif is_crypto_symbol(symbol):
             response = await self._http.get_crypto_bars(
                 symbol, timeframe, request.start, request.end, request.limit,
+                feed=CryptoFeed(self._config.crypto_feed),
             )
         else:
             response = await self._http.get_stock_bars(
                 symbol, timeframe, request.start, request.end, request.limit,
+                feed=DataFeed(self._config.stock_feed),
             )
         raw_bars = self._extract_symbol_series(response, symbol)
         bars = [parse_bar(b, bar_type, instrument) for b in raw_bars]
