@@ -119,6 +119,12 @@ class AlpacaDataClient(LiveMarketDataClient):
         # batched multi-symbol REST per asset class.
         self._polled_bar_subs: dict[BarType, "Any"] = {}  # bar_type → instrument
         self._polled_bar_last_ts: dict[BarType, int] = {}
+        # On the first poll for a freshly-registered bar_type we seed
+        # ``_polled_bar_last_ts`` to the latest bar timestamp in the
+        # response and *don't* dispatch — historical warmup is the
+        # strategy's job via ``request_bars``. Subsequent polls
+        # dispatch only strictly-newer bars.
+        self._polled_bar_seeded: set[BarType] = set()
         self._poll_task: asyncio.Task | None = None
 
     # ─── Lifecycle ─────────────────────────────────────────────────────────
@@ -250,6 +256,7 @@ class AlpacaDataClient(LiveMarketDataClient):
         if bar_type in self._polled_bar_subs:
             self._polled_bar_subs.pop(bar_type, None)
             self._polled_bar_last_ts.pop(bar_type, None)
+            self._polled_bar_seeded.discard(bar_type)
             return
         symbol, kind, ws = self._resolve_stream(bar_type.instrument_id)
         if ws is None:
@@ -504,10 +511,21 @@ class AlpacaDataClient(LiveMarketDataClient):
             instrument = self._polled_bar_subs.get(bar_type)
             if instrument is None:
                 continue
+
+            parsed = [parse_bar(raw, bar_type, instrument) for raw in raw_list]
+            if bar_type not in self._polled_bar_seeded:
+                # Seed-only pass: record the latest ts so the next poll
+                # pushes strictly-newer bars; do not dispatch anything.
+                self._polled_bar_last_ts[bar_type] = max(b.ts_event for b in parsed)
+                self._polled_bar_seeded.add(bar_type)
+                self._log.debug(
+                    f"seeded {bar_type}: last_ts={self._polled_bar_last_ts[bar_type]}",
+                )
+                continue
+
             last_ts = self._polled_bar_last_ts.get(bar_type, 0)
             new_pushed = 0
-            for raw in raw_list:
-                bar = parse_bar(raw, bar_type, instrument)
+            for bar in parsed:
                 if bar.ts_event <= last_ts:
                     continue
                 self._handle_data(bar)
