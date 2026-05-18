@@ -60,6 +60,16 @@ class AlpacaDataClientConfig(LiveDataClientConfig):
 
     data_sandbox: bool = False
 
+    # Daily bars aren't pushed over Alpaca's WebSockets — only 1-minute
+    # aggregates are. When a strategy subscribes to a *daily* (or larger)
+    # external bar, the data client falls back to scheduled REST polling.
+    # ``daily_poll_interval_secs`` is the wakeup cadence; on each tick the
+    # client batch-fetches recent daily bars for every subscribed symbol
+    # and dispatches any new (unseen-by-timestamp) ones. Defaults to
+    # 5 minutes — comfortable for EOD strategies (US daily bars publish
+    # within a few minutes of 16:00 ET).
+    daily_poll_interval_secs: float = 300.0
+
 
 class AlpacaExecClientConfig(LiveExecClientConfig):
     """Configuration for ``AlpacaExecutionClient``.

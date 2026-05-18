@@ -38,6 +38,7 @@ from nautilus_trader.data.messages import UnsubscribeBars
 from nautilus_trader.data.messages import UnsubscribeQuoteTicks
 from nautilus_trader.data.messages import UnsubscribeTradeTicks
 from nautilus_trader.live.data_client import LiveMarketDataClient
+from nautilus_trader.model.data import BarType
 from nautilus_trader.model.identifiers import InstrumentId
 
 from nautilus_alpaca.common.constants import ALPACA_CLIENT_ID
@@ -114,6 +115,12 @@ class AlpacaDataClient(LiveMarketDataClient):
         self._active_trade_subs: dict[StreamKind, set[str]] = defaultdict(set)
         self._active_bar_subs: dict[StreamKind, set[str]] = defaultdict(set)
 
+        # Daily-bar polling (Alpaca WS doesn't push daily bars). One task,
+        # batched multi-symbol REST per asset class.
+        self._polled_bar_subs: dict[BarType, "Any"] = {}  # bar_type → instrument
+        self._polled_bar_last_ts: dict[BarType, int] = {}
+        self._poll_task: asyncio.Task | None = None
+
     # ─── Lifecycle ─────────────────────────────────────────────────────────
 
     async def _connect(self) -> None:
@@ -130,9 +137,21 @@ class AlpacaDataClient(LiveMarketDataClient):
             coros.append(self._option_ws.start())
         if coros:
             await asyncio.gather(*coros)
+        # Daily-bar poller idles until something subscribes.
+        self._poll_task = asyncio.create_task(
+            self._daily_bar_poll_loop(),
+            name="alpaca-daily-bar-poll",
+        )
         self._log.info("AlpacaDataClient connected")
 
     async def _disconnect(self) -> None:
+        if self._poll_task is not None:
+            self._poll_task.cancel()
+            try:
+                await self._poll_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+            self._poll_task = None
         coros = []
         for ws in (self._stock_ws, self._crypto_ws, self._option_ws):
             if ws is not None:
@@ -171,13 +190,37 @@ class AlpacaDataClient(LiveMarketDataClient):
         self._active_trade_subs[kind].add(symbol)
 
     async def _subscribe_bars(self, command: SubscribeBars) -> None:
+        from nautilus_trader.model.enums import BarAggregation
         bar_type = command.bar_type
-        symbol, kind, ws = self._resolve_stream(bar_type.instrument_id)
+        spec = bar_type.spec
+        instrument_id = bar_type.instrument_id
+
+        # Daily (and larger) bars: Alpaca WS doesn't push these, so poll REST.
+        if spec.aggregation in (
+            BarAggregation.DAY,
+            BarAggregation.WEEK,
+            BarAggregation.MONTH,
+        ):
+            instrument = self._instrument_provider.find(instrument_id)
+            if instrument is None:
+                await self._instrument_provider.load_async(instrument_id)
+                instrument = self._instrument_provider.find(instrument_id)
+            if instrument is None:
+                self._log.warning(
+                    f"Cannot poll daily bars for {instrument_id}: instrument unknown",
+                )
+                return
+            self._polled_bar_subs[bar_type] = instrument
+            self._log.info(
+                f"Registered {bar_type} for REST polling "
+                f"(interval {self._config.daily_poll_interval_secs:.0f}s)",
+            )
+            return
+
+        # 1-minute bars: use the WebSocket stream.
+        symbol, kind, ws = self._resolve_stream(instrument_id)
         if ws is None:
             return
-        # Alpaca only streams 1-minute aggregates over WS — validate eagerly.
-        from nautilus_trader.model.enums import BarAggregation
-        spec = bar_type.spec
         if not (spec.aggregation == BarAggregation.MINUTE and spec.step == 1):
             self._log.warning(
                 f"Alpaca WS only streams 1-minute bars; got {bar_type}. "
@@ -202,7 +245,13 @@ class AlpacaDataClient(LiveMarketDataClient):
         self._active_trade_subs[kind].discard(symbol)
 
     async def _unsubscribe_bars(self, command: UnsubscribeBars) -> None:
-        symbol, kind, ws = self._resolve_stream(command.bar_type.instrument_id)
+        bar_type = command.bar_type
+        # Polled daily/weekly/monthly bar subscription?
+        if bar_type in self._polled_bar_subs:
+            self._polled_bar_subs.pop(bar_type, None)
+            self._polled_bar_last_ts.pop(bar_type, None)
+            return
+        symbol, kind, ws = self._resolve_stream(bar_type.instrument_id)
         if ws is None:
             return
         ws.unsubscribe_bars(symbol)
@@ -366,6 +415,107 @@ class AlpacaDataClient(LiveMarketDataClient):
             request.end,
             request.params,
         )
+
+    # ─── Daily bar polling ─────────────────────────────────────────────────
+
+    async def _daily_bar_poll_loop(self) -> None:
+        """Periodically REST-fetch new bars for any polled subscriptions.
+
+        Batches all polled symbols of the same asset class into one
+        multi-symbol call. Dedupe by per-bar_type last-pushed timestamp so
+        a freshly published bar (which may appear at the next interval, not
+        instantly at market close) only fires ``_handle_data`` once.
+        """
+        interval = max(30.0, float(self._config.daily_poll_interval_secs))
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                if not self._polled_bar_subs:
+                    continue
+                await self._poll_daily_bars_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                self._log.warning(f"daily bar poll iteration failed: {exc}")
+
+    async def _poll_daily_bars_once(self) -> None:
+        # Group polled subscriptions by stream kind so we can batch.
+        groups: dict[StreamKind, list[BarType]] = defaultdict(list)
+        for bar_type in list(self._polled_bar_subs.keys()):
+            sym = bar_type.instrument_id.symbol.value
+            if is_option_symbol(sym):
+                kind = StreamKind.OPTION
+            elif is_crypto_symbol(sym):
+                kind = StreamKind.CRYPTO
+            else:
+                kind = StreamKind.STOCK
+            groups[kind].append(bar_type)
+
+        # Look back enough days that a freshly-closed daily bar is included
+        # even if the poll runs during a long weekend or holiday.
+        from datetime import datetime as _dt
+        from datetime import timedelta as _td
+        from datetime import timezone as _tz
+        start = _dt.now(tz=_tz.utc) - _td(days=5)
+
+        for kind, bar_types in groups.items():
+            # Batch into chunks of 100 (Alpaca multi-symbol limit) per
+            # bar-spec (different specs need different timeframes).
+            by_spec: dict[tuple, list[BarType]] = defaultdict(list)
+            for bt in bar_types:
+                spec = bt.spec
+                by_spec[(spec.step, spec.aggregation)].append(bt)
+            for (_step, _agg), bts in by_spec.items():
+                symbols = [bt.instrument_id.symbol.value for bt in bts]
+                # Take the spec from the first bar_type — all share it.
+                timeframe = bar_spec_to_timeframe(bts[0])
+                for chunk_start in range(0, len(symbols), 100):
+                    chunk = symbols[chunk_start:chunk_start + 100]
+                    chunk_bts = bts[chunk_start:chunk_start + 100]
+                    try:
+                        if kind == StreamKind.CRYPTO:
+                            response = await self._http.get_crypto_bars(
+                                chunk, timeframe, start, None, None,
+                                feed=CryptoFeed(self._config.crypto_feed),
+                            )
+                        elif kind == StreamKind.OPTION:
+                            response = await self._http.get_option_bars(
+                                chunk, timeframe, start, None, None,
+                            )
+                        else:
+                            response = await self._http.get_stock_bars(
+                                chunk, timeframe, start, None, None,
+                                feed=DataFeed(self._config.stock_feed),
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        self._log.warning(f"daily bar poll fetch failed: {exc}")
+                        continue
+                    self._dispatch_polled_bars(chunk_bts, response)
+
+    def _dispatch_polled_bars(self, bar_types: list[BarType], response: Any) -> None:
+        data = getattr(response, "data", response)
+        if not isinstance(data, dict):
+            return
+        for bar_type in bar_types:
+            sym = bar_type.instrument_id.symbol.value
+            raw_list = data.get(sym, []) or []
+            if not raw_list:
+                continue
+            instrument = self._polled_bar_subs.get(bar_type)
+            if instrument is None:
+                continue
+            last_ts = self._polled_bar_last_ts.get(bar_type, 0)
+            new_pushed = 0
+            for raw in raw_list:
+                bar = parse_bar(raw, bar_type, instrument)
+                if bar.ts_event <= last_ts:
+                    continue
+                self._handle_data(bar)
+                last_ts = max(last_ts, bar.ts_event)
+                new_pushed += 1
+            if new_pushed:
+                self._polled_bar_last_ts[bar_type] = last_ts
+                self._log.info(f"polled {bar_type}: pushed {new_pushed} new bar(s)")
 
     # ─── Routing helpers ──────────────────────────────────────────────────
 
