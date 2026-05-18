@@ -31,7 +31,7 @@ pip install nautilus-alpaca
 Or from source:
 
 ```bash
-git clone https://github.com/your-org/nautilus-alpaca
+git clone https://github.com/gmatrunich/nautilus-alpaca
 cd nautilus-alpaca
 pip install -e ".[dev]"
 ```
