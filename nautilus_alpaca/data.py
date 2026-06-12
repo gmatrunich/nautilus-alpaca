@@ -14,6 +14,7 @@ import asyncio
 from collections import defaultdict
 from typing import Any
 
+from alpaca.data.enums import Adjustment
 from alpaca.data.enums import CryptoFeed
 from alpaca.data.enums import DataFeed
 from alpaca.data.enums import OptionsFeed
@@ -119,6 +120,7 @@ class AlpacaDataClient(LiveMarketDataClient):
         # batched multi-symbol REST per asset class.
         self._polled_bar_subs: dict[BarType, "Any"] = {}  # bar_type → instrument
         self._polled_bar_last_ts: dict[BarType, int] = {}
+        self._polled_bar_sub_ns: dict[BarType, int] = {}  # subscribe-time anchor
         # On the first poll for a freshly-registered bar_type we seed
         # ``_polled_bar_last_ts`` to the latest bar timestamp in the
         # response and *don't* dispatch — historical warmup is the
@@ -217,6 +219,7 @@ class AlpacaDataClient(LiveMarketDataClient):
                 )
                 return
             self._polled_bar_subs[bar_type] = instrument
+            self._polled_bar_sub_ns[bar_type] = self._clock.timestamp_ns()
             self._log.info(
                 f"Registered {bar_type} for REST polling "
                 f"(interval {self._config.daily_poll_interval_secs:.0f}s)",
@@ -256,6 +259,7 @@ class AlpacaDataClient(LiveMarketDataClient):
         if bar_type in self._polled_bar_subs:
             self._polled_bar_subs.pop(bar_type, None)
             self._polled_bar_last_ts.pop(bar_type, None)
+            self._polled_bar_sub_ns.pop(bar_type, None)
             self._polled_bar_seeded.discard(bar_type)
             return
         symbol, kind, ws = self._resolve_stream(bar_type.instrument_id)
@@ -411,6 +415,7 @@ class AlpacaDataClient(LiveMarketDataClient):
             response = await self._http.get_stock_bars(
                 symbol, timeframe, request.start, request.end, request.limit,
                 feed=DataFeed(self._config.stock_feed),
+                adjustment=Adjustment(self._config.stock_adjustment),
             )
         raw_bars = self._extract_symbol_series(response, symbol)
         bars = [parse_bar(b, bar_type, instrument) for b in raw_bars]
@@ -496,6 +501,7 @@ class AlpacaDataClient(LiveMarketDataClient):
                             response = await self._http.get_stock_bars(
                                 chunk, timeframe, start, None, None,
                                 feed=DataFeed(self._config.stock_feed),
+                                adjustment=Adjustment(self._config.stock_adjustment),
                             )
                     except Exception as exc:  # noqa: BLE001
                         self._log.warning(f"daily bar poll fetch failed: {exc}")
@@ -537,12 +543,29 @@ class AlpacaDataClient(LiveMarketDataClient):
                     # Nothing final yet (fresh registration on a weekend
                     # / pre-market). Retry on the next poll cycle.
                     continue
-                self._polled_bar_last_ts[bar_type] = max(b.ts_event for b in complete)
-                self._polled_bar_seeded.add(bar_type)
-                self._log.debug(
-                    f"seeded {bar_type}: last_ts={self._polled_bar_last_ts[bar_type]}",
-                )
-                continue
+                if self._config.dispatch_first_complete_bar:
+                    # Anchor the dedup watermark at SUBSCRIBE time: bars
+                    # already final back then are warm-up territory, bars
+                    # that completed since must be dispatched below.
+                    sub_ns = self._polled_bar_sub_ns.get(bar_type, now_ns)
+                    self._polled_bar_last_ts[bar_type] = max(
+                        (b.ts_event for b in complete
+                         if sub_ns - b.ts_event >= threshold_ns),
+                        default=0,
+                    )
+                    self._polled_bar_seeded.add(bar_type)
+                    self._log.debug(
+                        f"seeded {bar_type} at subscribe anchor: "
+                        f"last_ts={self._polled_bar_last_ts[bar_type]}",
+                    )
+                    # fall through to the dispatch loop
+                else:
+                    self._polled_bar_last_ts[bar_type] = max(b.ts_event for b in complete)
+                    self._polled_bar_seeded.add(bar_type)
+                    self._log.debug(
+                        f"seeded {bar_type}: last_ts={self._polled_bar_last_ts[bar_type]}",
+                    )
+                    continue
 
             last_ts = self._polled_bar_last_ts.get(bar_type, 0)
             new_pushed = 0

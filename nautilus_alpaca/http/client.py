@@ -14,6 +14,7 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
+from alpaca.data.enums import Adjustment
 from alpaca.data.enums import CryptoFeed
 from alpaca.data.enums import DataFeed
 from alpaca.data.historical.crypto import CryptoHistoricalDataClient
@@ -191,6 +192,7 @@ class AlpacaHttpClient:
         end: datetime | None = None,
         limit: int | None = None,
         feed: DataFeed | None = None,
+        adjustment: Adjustment | None = None,
     ) -> Any:
         request = StockBarsRequest(
             symbol_or_symbols=symbol_or_symbols,
@@ -199,6 +201,7 @@ class AlpacaHttpClient:
             end=end,
             limit=limit,
             feed=feed,
+            adjustment=adjustment,
         )
         return await asyncio.to_thread(self._stock_data.get_stock_bars, request)
 

@@ -70,6 +70,27 @@ class AlpacaDataClientConfig(LiveDataClientConfig):
     # within a few minutes of 16:00 ET).
     daily_poll_interval_secs: float = 300.0
 
+    # Corporate-action adjustment applied to STOCK bars fetched over REST
+    # (both Strategy.request_bars warm-up history and the daily-bar poller).
+    # One of "raw", "split", "dividend", "all" (alpaca.data.enums.Adjustment).
+    # Strategies whose indicators span months of history generally want
+    # "all": with "raw", a split inside the lookback window shows up as a
+    # fake ±50..400% daily return. Note the poller only re-fetches a ~5-day
+    # window, so an adjustment landing mid-run still leaves a seam against
+    # the already-collected history until the strategy re-warms (restart).
+    stock_adjustment: str = "raw"
+
+    # By default the poller's FIRST poll for a fresh subscription silently
+    # seeds its dedup watermark with the latest complete bar and does NOT
+    # dispatch it (historical warm-up is the strategy's job). That swallows
+    # a bar which completes between subscribe time and the first poll —
+    # e.g. a node started minutes before the 16:00 ET close never sees that
+    # session. With this flag the watermark is anchored at SUBSCRIBE time
+    # instead: bars already complete at subscribe stay seed-only, bars
+    # completing afterwards are dispatched. Meant for subscribers whose
+    # request_bars warm-up cutoff is likewise anchored at start time.
+    dispatch_first_complete_bar: bool = False
+
 
 class AlpacaExecClientConfig(LiveExecClientConfig):
     """Configuration for ``AlpacaExecutionClient``.
