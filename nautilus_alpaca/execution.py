@@ -144,6 +144,7 @@ class AlpacaExecutionClient(LiveExecutionClient):
         self._http = http_client
         self._ws = trading_ws
         self._config = config
+        self._account_refresh_task: asyncio.Task | None = None
 
     # ─── Lifecycle ─────────────────────────────────────────────────────────
 
@@ -151,9 +152,21 @@ class AlpacaExecutionClient(LiveExecutionClient):
         await self._instrument_provider.initialize()
         await self._refresh_account_state()
         await self._ws.start(self._on_trade_update)
+        if self._config.account_refresh_interval_secs > 0.0:
+            self._account_refresh_task = asyncio.create_task(
+                self._account_refresh_loop(),
+                name="alpaca-account-refresh",
+            )
         self._log.info("AlpacaExecutionClient connected")
 
     async def _disconnect(self) -> None:
+        if self._account_refresh_task is not None:
+            self._account_refresh_task.cancel()
+            try:
+                await self._account_refresh_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+            self._account_refresh_task = None
         await self._ws.stop()
         self._log.info("AlpacaExecutionClient disconnected")
 
@@ -601,10 +614,25 @@ class AlpacaExecutionClient(LiveExecutionClient):
 
     # ─── Account state ─────────────────────────────────────────────────────
 
+    async def _account_refresh_loop(self) -> None:
+        """Publish cash/equity changes which happen outside order fills."""
+        interval = self._config.account_refresh_interval_secs
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await self._refresh_account_state()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                # A transient REST failure must not kill periodic refreshes for
+                # the rest of the process lifetime. The strategy independently
+                # rejects an AccountState once it becomes stale.
+                self._log.error(f"Periodic account refresh failed: {exc}")
+
     async def _refresh_account_state(self) -> None:
         try:
             account: TradeAccount = await self._http.get_account()
-        except APIError as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             self._log.error(f"Failed to fetch account state: {exc}")
             return
         ts = self._clock.timestamp_ns()
@@ -936,4 +964,3 @@ def _build_order_request(symbol: str, order: NautilusOrder):
                 kwargs["trail_percent"] = float(order.trailing_offset)
         return TrailingStopOrderRequest(**kwargs)
     raise ValueError(f"Unsupported order type: {order.order_type}")
-

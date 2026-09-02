@@ -106,6 +106,10 @@ class AlpacaExecClientConfig(LiveExecClientConfig):
         REST endpoint override.
     trading_ws_url_override : str, optional
         Trading-stream WebSocket URL override.
+    account_refresh_interval_secs : float, default 0
+        Periodic REST refresh cadence for cash/equity AccountState. Disabled by
+        default so existing adapter consumers do not change behavior. This
+        captures fees, dividends and transfers which do not arrive as fills.
     """
 
     api_key: str | None = None
@@ -114,3 +118,5 @@ class AlpacaExecClientConfig(LiveExecClientConfig):
 
     trading_url_override: str | None = None
     trading_ws_url_override: str | None = None
+
+    account_refresh_interval_secs: float = 0.0
