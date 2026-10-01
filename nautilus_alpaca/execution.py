@@ -872,11 +872,6 @@ class AlpacaExecutionClient(LiveExecutionClient):
             else PositionSide.SHORT if qty_decimal < 0
             else PositionSide.FLAT
         )
-        avg_px = (
-            Decimal(str(pos.avg_entry_price))
-            if pos.avg_entry_price is not None
-            else None
-        )
         ts = self._clock.timestamp_ns()
         kwargs: dict[str, Any] = {
             "account_id": self.account_id or self._fallback_account_id(),
@@ -887,8 +882,40 @@ class AlpacaExecutionClient(LiveExecutionClient):
             "ts_last": ts,
             "ts_init": ts,
         }
-        if avg_px is not None:
-            kwargs["avg_px_open"] = avg_px
+        # `avg_px_open` is deliberately NOT reported from Alpaca's
+        # `avg_entry_price`: the two are different definitions, not two
+        # measurements of one number.
+        #
+        #   Alpaca   -> FIFO cost basis of the shares STILL held: a partial sell
+        #               retires the oldest lots and re-bases the average.
+        #   Nautilus -> running weighted average that a reduction leaves
+        #               UNTOUCHED (only increases move `avg_px_open`).
+        #
+        # They agree until a position is first reduced and diverge permanently
+        # after that, with no way to convert one into the other from here (it
+        # would take the position's whole fill history back to flat).
+        #
+        # Reporting it anyway cost more than a cosmetic log line. Verified on
+        # AntiBeta's BTAL position (2866 shares, 20 fills, quantity matching the
+        # venue exactly): internal 11.8488 vs Alpaca 11.9356, a 0.72% gap that
+        # the engine reported every boot as "incomplete reconciliation data from
+        # the venue" (live/execution_engine.py) when both sides were complete.
+        # Worse, the same field is fed to `calculate_reconciliation_price` as
+        # `target_position_avg_px` whenever quantities DO disagree, and that
+        # solver assumes one shared convention. The error is amplified by
+        # position_qty / diff_qty, measured with the real pyo3 function:
+        #
+        #   drift     1 share  -> corrective fill priced at  $260.68
+        #   drift    10 shares -> $36.81      drift 100 shares -> $14.42
+        #   (same inputs, consistent averages -> $11.8488 at every drift,
+        #    i.e. a pure quantity fix that leaves the average alone)
+        #
+        # A $260 inferred fill on a $12 instrument corrupts the position's cost
+        # basis and every PnL number derived from it. Omitting the field makes
+        # the engine fall back to the last quote, and with no quote subscription
+        # to the internal average — which is exactly right for a quantity-only
+        # drift. Do not re-add this mapping without solving the convention
+        # problem first.
         return PositionStatusReport(**kwargs)
 
     def _fallback_account_id(self) -> AccountId:
