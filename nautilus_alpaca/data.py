@@ -14,6 +14,8 @@ import asyncio
 from collections import defaultdict
 from typing import Any
 
+import pandas as pd
+
 from alpaca.data.enums import Adjustment
 from alpaca.data.enums import CryptoFeed
 from alpaca.data.enums import DataFeed
@@ -342,7 +344,7 @@ class AlpacaDataClient(LiveMarketDataClient):
             )
         else:
             response = await self._http.get_stock_quotes(
-                symbol, request.start, request.end, request.limit,
+                symbol, request.start, self._stock_end(request.end), request.limit,
                 feed=DataFeed(self._config.stock_feed),
             )
         raw_quotes = self._extract_symbol_series(response, symbol)
@@ -376,7 +378,7 @@ class AlpacaDataClient(LiveMarketDataClient):
             )
         else:
             response = await self._http.get_stock_trades(
-                symbol, request.start, request.end, request.limit,
+                symbol, request.start, self._stock_end(request.end), request.limit,
                 feed=DataFeed(self._config.stock_feed),
             )
         raw_trades = self._extract_symbol_series(response, symbol)
@@ -389,6 +391,26 @@ class AlpacaDataClient(LiveMarketDataClient):
             request.end,
             request.params,
         )
+
+    def _stock_end(self, end: Any) -> Any:
+        """Keep a stock history request's ``end`` out of the SIP embargo window.
+
+        Alpaca's free market-data plan serves SIP history only up to 15
+        minutes ago; an ``end`` inside that window is refused with HTTP 403
+        "subscription does not permit querying recent SIP data". Nautilus
+        fills a missing ``end`` with *now*, so on ``stock_feed="sip"`` every
+        plain ``request_bars()`` (e.g. a strategy warm-up) would fail. Clamp
+        ``end`` to now - 16 min; other feeds pass through untouched.
+        """
+        if self._config.stock_feed != "sip":
+            return end
+        limit = pd.Timestamp(self._clock.timestamp_ns() - _SIP_EMBARGO_NS, tz="UTC")
+        if end is None:
+            return limit
+        end_ts = pd.Timestamp(end)
+        if end_ts.tzinfo is None:
+            end_ts = end_ts.tz_localize("UTC")
+        return limit if end_ts > limit else end
 
     async def _request_bars(self, request: RequestBars) -> None:
         bar_type = request.bar_type
@@ -413,7 +435,7 @@ class AlpacaDataClient(LiveMarketDataClient):
             )
         else:
             response = await self._http.get_stock_bars(
-                symbol, timeframe, request.start, request.end, request.limit,
+                symbol, timeframe, request.start, self._stock_end(request.end), request.limit,
                 feed=DataFeed(self._config.stock_feed),
                 adjustment=Adjustment(self._config.stock_adjustment),
             )
@@ -621,22 +643,28 @@ class AlpacaDataClient(LiveMarketDataClient):
 
 _HOUR_NS = 3_600_000_000_000
 _DAY_NS = 86_400_000_000_000
+# SIP history on the free plan is embargoed for 15 min (see _stock_end);
+# one extra minute of slack against clock skew.
+_SIP_EMBARGO_NS = 16 * 60 * 1_000_000_000
 
 
 def _bar_completion_ns(bar_type: BarType) -> int:
     """Time after ``ts_event`` by which a polled bar can be treated as final.
 
-    Alpaca daily bars use ``ts_event`` = bar's *start* (e.g. 04:00 UTC
-    for US equities) but the bar isn't finalized until after market close
-    (~20:00 UTC under DST, ~21:00 EST). 16h covers both regimes with a
-    margin. Weekly/monthly thresholds are conservative — push happens at
-    most one full bar-duration late, which is acceptable for those
-    aggregations.
+    Alpaca daily bars use ``ts_event`` = the session date at midnight ET
+    (04:00Z under EDT, 05:00Z under EST); the regular session closes at
+    16:00 ET = 16h later in BOTH regimes. A 16h gate therefore had zero
+    margin, and on a 15-min-delayed SIP feed a bar fetched at exactly the
+    close only covers trading up to 15:45 ET -- an incomplete close/volume
+    that the ts-dedup would then lock in for good. 17h = close + 1h: past
+    the SIP embargo and the closing-auction prints in both regimes.
+    Weekly/monthly thresholds are conservative -- push happens at most one
+    full bar-duration late, which is acceptable for those aggregations.
     """
     from nautilus_trader.model.enums import BarAggregation
     spec = bar_type.spec
     if spec.aggregation == BarAggregation.DAY:
-        return 16 * _HOUR_NS
+        return 17 * _HOUR_NS
     if spec.aggregation == BarAggregation.WEEK:
         return 7 * _DAY_NS
     if spec.aggregation == BarAggregation.MONTH:
